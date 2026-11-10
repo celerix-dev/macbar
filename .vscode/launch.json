@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:celerix-macbar}",
+            "name": "Debug CelerixMacBar",
+            "target": "CelerixMacBar",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug CelerixMacBar"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:celerix-macbar}",
+            "name": "Release CelerixMacBar",
+            "target": "CelerixMacBar",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release CelerixMacBar"
+        }
+    ]
+}
