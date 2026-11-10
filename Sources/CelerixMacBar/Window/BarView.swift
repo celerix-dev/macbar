@@ -136,9 +136,10 @@ struct BarView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if model.settings.showNowPlaying, model.nowPlaying.hasTrack {
+            if model.settings.showNowPlaying {
                 nowPlayingWidget
-                    .frame(maxWidth: 280)
+                    .frame(minWidth: 190, maxWidth: 280)
+                    .layoutPriority(1)
             }
 
             HStack(spacing: 10) {
@@ -434,16 +435,16 @@ struct BarView: View {
             Image(systemName: model.nowPlaying.isPlaying ? "speaker.wave.3.fill" : "speaker.slash.fill")
                 .font(.system(size: 11, weight: .medium))
 
-            if model.nowPlaying.isPlaying {
+            if model.nowPlaying.hasTrack && model.nowPlaying.isPlaying {
                 CALayerBarsView()
                     .frame(width: 8, height: 10)
                     .transition(.opacity)
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.nowPlaying.title)
+                Text(model.nowPlaying.hasTrack ? model.nowPlaying.title : "Nothing Playing")
                     .lineLimit(1)
-                if !model.nowPlaying.artist.isEmpty {
+                if model.nowPlaying.hasTrack && !model.nowPlaying.artist.isEmpty {
                     Text(model.nowPlaying.artist)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)

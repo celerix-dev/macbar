@@ -1,5 +1,7 @@
 import Foundation
 import AppKit
+import CoreAudio
+import Darwin
 
 struct NowPlayingData: Codable {
     let hasTrack: Bool
@@ -96,6 +98,7 @@ final class NowPlayingMonitor {
         if let cmdPtr = dlsym(handle, "MRMediaRemoteSendCommand") {
             mrSendCmd = unsafeBitCast(cmdPtr, to: MRSendCmdFunc.self)
         }
+
     }
 
     func startObserving() {
@@ -217,14 +220,220 @@ final class NowPlayingMonitor {
                             self.updateDataIfChanged(updated, force: force)
                         }
                     }
+
                 }
             } else {
-                self.fallbackAppleScriptCheck(force: force)
+                self.fallbackAppleScriptCheck(force: force, isPlayingHint: playbackRate > 0)
             }
         }
     }
 
-    private func fallbackAppleScriptCheck(force: Bool = false) {
+    private func fallbackAppleScriptCheck(force: Bool = false, isPlayingHint: Bool = false) {
+        if isPlayingHint {
+            fetchPlayingApplication(force: force)
+            return
+        }
+
+        if let mrIsPlaying {
+            mrIsPlaying(DispatchQueue.main) { [weak self] isPlaying in
+                guard let self else { return }
+                if isPlaying {
+                    if self.currentData.hasTrack {
+                        self.updateDataIfChanged(
+                            NowPlayingData(
+                                hasTrack: true,
+                                title: self.currentData.title,
+                                artist: self.currentData.artist,
+                                album: self.currentData.album,
+                                isPlaying: true,
+                                duration: self.currentData.duration,
+                                elapsedTime: self.currentData.elapsedTime
+                            ),
+                            force: force
+                        )
+                    } else {
+                        self.fetchPlayingApplication(force: force)
+                    }
+                } else {
+                    self.fallbackKnownMusicApps(force: force)
+                }
+            }
+        } else {
+            fallbackKnownMusicApps(force: force)
+        }
+    }
+
+    private func fetchPlayingApplication(force: Bool, isPlaying: Bool = true) {
+        guard let mrGetPID else {
+            if isPlaying, let app = NSWorkspace.shared.frontmostApplication {
+                publishPlayingApplication(app, force: force, isPlaying: true)
+            } else {
+                publishEmptyData(force: force)
+            }
+            return
+        }
+
+        mrGetPID(DispatchQueue.main) { [weak self] pid in
+            guard let self else { return }
+            let app = pid > 0 ? NSRunningApplication(processIdentifier: pid) : nil
+            if let app {
+                self.publishPlayingApplication(app, force: force, isPlaying: isPlaying)
+            } else if isPlaying, let frontmostApp = NSWorkspace.shared.frontmostApplication {
+                self.publishPlayingApplication(frontmostApp, force: force, isPlaying: true)
+            } else {
+                self.publishEmptyData(force: force)
+            }
+        }
+    }
+
+    private func publishPlayingApplication(
+        _ app: NSRunningApplication,
+        force: Bool,
+        isPlaying: Bool = true
+    ) {
+        let appName = app.localizedName ?? app.bundleIdentifier ?? "Media player"
+        let windowTitle = focusedWindowTitle(for: app.processIdentifier)
+        let track = windowTitle.map(parseTrackTitle) ?? (title: appName, artist: "")
+        let resolvedIsPlaying = playbackState(for: app.processIdentifier) ?? isPlaying
+        updateDataIfChanged(
+            NowPlayingData(
+                hasTrack: true,
+                title: track.title,
+                artist: track.artist,
+                album: "",
+                isPlaying: resolvedIsPlaying,
+                duration: nil,
+                elapsedTime: nil
+            ),
+            force: force
+        )
+    }
+
+    private func parseTrackTitle(_ rawTitle: String) -> (title: String, artist: String) {
+        let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let separator = title.range(of: " - ") else {
+            return (title, "")
+        }
+        let trackTitle = String(title[..<separator.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let artist = String(title[separator.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trackTitle.isEmpty ? title : trackTitle, artist)
+    }
+
+    private func playbackState(for pid: pid_t) -> Bool? {
+        let appElement = AXUIElementCreateApplication(pid)
+        var menuBarValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXMenuBarAttribute as CFString,
+            &menuBarValue
+        ) == .success,
+        let menuBarValue else {
+            return nil
+        }
+
+        let menuBar = menuBarValue as! AXUIElement
+        guard let playbackMenu = findAccessibilityElement(
+            menuBar,
+            role: kAXMenuBarItemRole as String,
+            title: "Playback"
+        ) else {
+            return nil
+        }
+
+        if findAccessibilityElement(playbackMenu, role: kAXMenuItemRole as String, title: "Pause") != nil {
+            return true
+        }
+        if findAccessibilityElement(playbackMenu, role: kAXMenuItemRole as String, title: "Play") != nil {
+            return false
+        }
+        return nil
+    }
+
+    private func findAccessibilityElement(
+        _ element: AXUIElement,
+        role: String,
+        title: String,
+        depth: Int = 0
+    ) -> AXUIElement? {
+        guard depth < 8 else { return nil }
+        if accessibilityString(element, attribute: kAXRoleAttribute as String) == role,
+           accessibilityString(element, attribute: kAXTitleAttribute as String) == title {
+            return element
+        }
+
+        var childrenValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &childrenValue
+        ) == .success,
+        let children = childrenValue as? [AXUIElement] else {
+            return nil
+        }
+
+        for child in children {
+            if let match = findAccessibilityElement(child, role: role, title: title, depth: depth + 1) {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private func accessibilityString(_ element: AXUIElement, attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+
+    private func focusedWindowTitle(for pid: pid_t) -> String? {
+        let appElement = AXUIElementCreateApplication(pid)
+        var windowsValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            appElement,
+            kAXWindowsAttribute as CFString,
+            &windowsValue
+        ) == .success,
+        let windows = windowsValue as? [AXUIElement],
+        let window = windows.first {
+            var titleValue: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                window,
+                kAXTitleAttribute as CFString,
+                &titleValue
+            ) == .success,
+            let title = titleValue as? String {
+                let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedTitle.isEmpty {
+                    return trimmedTitle
+                }
+            }
+        }
+
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedWindowAttribute as CFString,
+            &windowValue
+        ) == .success,
+        let windowValue else {
+            return nil
+        }
+        let window = windowValue as! AXUIElement
+
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            window,
+            kAXTitleAttribute as CFString,
+            &titleValue
+        ) == .success else {
+            return nil
+        }
+        return (titleValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func fallbackKnownMusicApps(force: Bool) {
         // Fallback for Spotify or Music if MediaRemote is idle
         let runningApps = NSWorkspace.shared.runningApplications
         let hasSpotify = runningApps.contains { $0.bundleIdentifier == "com.spotify.client" || $0.localizedName == "Spotify" }
@@ -235,16 +444,7 @@ final class NowPlayingMonitor {
         } else if hasMusic {
             executeAppleScriptTrackQuery(app: "Music", force: force)
         } else {
-            let emptyData = NowPlayingData(
-                hasTrack: false,
-                title: "",
-                artist: "",
-                album: "",
-                isPlaying: false,
-                duration: nil,
-                elapsedTime: nil
-            )
-            updateDataIfChanged(emptyData, force: force)
+            fallbackActiveAudioOutput(force: force)
         }
     }
 
@@ -279,20 +479,150 @@ final class NowPlayingMonitor {
                     elapsedTime: nil
                 )
                 updateDataIfChanged(newData, force: force)
+                if !isPlaying, let activeApp = activeAudioOutputApplication() {
+                    publishPlayingApplication(activeApp, force: force)
+                }
                 return
             }
         }
 
-        let emptyData = NowPlayingData(
-            hasTrack: false,
-            title: "",
-            artist: "",
-            album: "",
-            isPlaying: false,
-            duration: nil,
-            elapsedTime: nil
+        fallbackActiveAudioOutput(force: force)
+    }
+
+    private func fallbackActiveAudioOutput(force: Bool) {
+        guard let app = activeAudioOutputApplication() else {
+            if let tidalApp = NSWorkspace.shared.runningApplications.first(where: {
+                $0.bundleIdentifier == "com.tidal.desktop"
+            }) {
+                publishPlayingApplication(tidalApp, force: force, isPlaying: currentData.isPlaying)
+                return
+            }
+            fetchPlayingApplication(force: force, isPlaying: false)
+            return
+        }
+
+        publishPlayingApplication(app, force: force)
+    }
+
+    private func publishEmptyData(force: Bool) {
+        updateDataIfChanged(
+            NowPlayingData(
+                hasTrack: false,
+                title: "",
+                artist: "",
+                album: "",
+                isPlaying: false,
+                duration: nil,
+                elapsedTime: nil
+            ),
+            force: force
         )
-        updateDataIfChanged(emptyData, force: force)
+    }
+
+    private func activeAudioOutputApplication() -> NSRunningApplication? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        let systemObject = AudioObjectID(kAudioObjectSystemObject)
+        let sizeStatus = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &dataSize)
+        guard sizeStatus == noErr else {
+            return nil
+        }
+
+        let processCount = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard processCount > 0 else { return nil }
+        var processObjects = [AudioObjectID](repeating: kAudioObjectUnknown, count: processCount)
+        let listStatus = processObjects.withUnsafeMutableBufferPointer { buffer in
+            AudioObjectGetPropertyData(
+                systemObject,
+                &address,
+                0,
+                nil,
+                &dataSize,
+                buffer.baseAddress!
+            )
+        }
+        guard listStatus == noErr else {
+            return nil
+        }
+
+        var fallbackApplication: NSRunningApplication?
+        for processObject in processObjects where processObject != kAudioObjectUnknown {
+            var pid: pid_t = 0
+            var pidSize = UInt32(MemoryLayout<pid_t>.size)
+            var pidAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioProcessPropertyPID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectGetPropertyData(
+                processObject,
+                &pidAddress,
+                0,
+                nil,
+                &pidSize,
+                &pid
+            ) == noErr, pid > 0, pid != getpid() else {
+                continue
+            }
+
+            var isRunningOutput: UInt32 = 0
+            var outputSize = UInt32(MemoryLayout<UInt32>.size)
+            var outputAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioProcessPropertyIsRunningOutput,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectGetPropertyData(
+                processObject,
+                &outputAddress,
+                0,
+                nil,
+                &outputSize,
+                &isRunningOutput
+            ) == noErr, isRunningOutput != 0 else {
+                continue
+            }
+
+            if let app = applicationOwningAudioProcess(pid) {
+                if playbackState(for: app.processIdentifier) == true {
+                    return app
+                }
+                if playbackState(for: app.processIdentifier) == nil {
+                    fallbackApplication = fallbackApplication ?? app
+                }
+            }
+        }
+
+        return fallbackApplication
+    }
+
+    private func applicationOwningAudioProcess(_ pid: pid_t) -> NSRunningApplication? {
+        var currentPID = pid
+        var visitedPIDs = Set<pid_t>()
+
+        for _ in 0..<8 where currentPID > 1 {
+            guard visitedPIDs.insert(currentPID).inserted else { return nil }
+            if let app = NSRunningApplication(processIdentifier: currentPID) {
+                return app
+            }
+
+            var processInfo = proc_bsdinfo()
+            let bytesRead = proc_pidinfo(
+                currentPID,
+                PROC_PIDTBSDINFO,
+                0,
+                &processInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            )
+            guard bytesRead == MemoryLayout<proc_bsdinfo>.size else { return nil }
+            currentPID = pid_t(processInfo.pbi_ppid)
+        }
+
+        return nil
     }
 
     private func updateDataIfChanged(_ newData: NowPlayingData, force: Bool = false) {
